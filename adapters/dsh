@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# DeepSeek Harness adapter: run one task, print the answer.
+exec dsh --profile headless "$*"

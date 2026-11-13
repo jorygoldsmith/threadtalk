@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+#
+# threadtalk-watch — poll the box and run incoming instructions through an agent.
+#
+# Config (env):
+#   THREADTALK_AGENT  (required) path to an adapter (see adapters/)
+#   THREADTALK_ME / THREADTALK_PEER / THREADTALK_BOX / THREADTALK_HOST
+#   THREADTALK_RECV   local receive dir (default ~/.threadtalk/receive/$ME)
+#   THREADTALK_STATE  processed-marker dir (default ~/.threadtalk/state/$ME)
+#
+# Usage: threadtalk-watch [interval_seconds]
+#
+# Deliberately dumb: polls, runs, replies. No daemon, no queue, no registry.
+set -u
+
+INTERVAL="${1:-5}"
+AGENT="${THREADTALK_AGENT:?set THREADTALK_AGENT=/path/to/adapter}"
+ME="${THREADTALK_ME:?set THREADTALK_ME}"
+PEER="${THREADTALK_PEER:?set THREADTALK_PEER}"
+RECV="${THREADTALK_RECV:-$HOME/.threadtalk/receive/$ME}"
+STATE="${THREADTALK_STATE:-$HOME/.threadtalk/state/$ME}"
+BIN="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/threadtalk"
+
+mkdir -p "$RECV" "$STATE"
+
+reply() { # $1 base, $2 status, $3 body
+    local r="${1%.*}.reply"
+    printf 'To: %s\nFrom: %s\nDate: %s\nIn response to: %s\nStatus: %s\n---\n\n%s\n' \
+        "$PEER" "$ME" "$(date '+%F %T')" "$1" "$2" "$3" > "$RECV/$r"
+    bash "$BIN" "$RECV/$r"
+    touch "$STATE/$1.done"
+}
+
+echo "threadtalk-watch: me=$ME peer=$PEER interval=${INTERVAL}s agent=$AGENT"
+while :; do
+    bash "$BIN" get >/dev/null 2>&1
+
+    for f in "$RECV"/*.instr; do
+        [ -f "$f" ] || continue
+        base="$(basename "$f")"
+        [ -f "$STATE/$base.done" ] && continue
+
+        kind="$(awk '/^[[:space:]]*(PROMPT|AGENT|CMD|NOTE):/{print toupper($1); exit}' "$f" | tr -d ':')"
+        case "$kind" in
+            PROMPT|AGENT)
+                task="$(awk '/^[[:space:]]*(PROMPT|AGENT):/{sub(/^[[:space:]]*(PROMPT|AGENT):[[:space:]]*/,""); print; r=1; next} r{print}' "$f")"
+                echo "  run  $base"
+                answer="$(bash "$AGENT" "$task" 2>&1)"
+                reply "$base" "AGENT" "$answer"
+                ;;
+            CMD)
+                cmd="$(awk '/^[[:space:]]*CMD:/{sub(/^[[:space:]]*CMD:[[:space:]]*/,""); print; exit}' "$f")"
+                echo "  cmd  $base"
+                out="$(cd "$RECV" && eval "$cmd" 2>&1)"
+                reply "$base" "CMD" "$out"
+                ;;
+            NOTE)
+                echo "  note $base"
+                touch "$STATE/$base.done"
+                ;;
+        esac
+    done
+
+    sleep "$INTERVAL"
+done

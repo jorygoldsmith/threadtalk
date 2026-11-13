@@ -1,0 +1,5 @@
+# threadtalk local state
+.threadtalk/
+*.bak
+*.bak.*
+.DS_Store

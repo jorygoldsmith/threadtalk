@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+#
+# threadtalk — send / receive messages over a threadtalk box.
+#
+# Config (env):
+#   THREADTALK_BOX    (required) box path, e.g. /srv/threadtalk
+#   THREADTALK_ME     (required) this participant's name, e.g. alice
+#   THREADTALK_PEER   (required) the other participant's name, e.g. bob
+#   THREADTALK_HOST   optional ssh target (user@host). Omit to use a local/shared box.
+#   THREADTALK_RECV   local receive dir (default: ~/.threadtalk/receive/$ME)
+#   THREADTALK_THRESHOLD  bytes above which a file is sent as bulk (default 10 MiB)
+#
+# Usage:
+#   threadtalk <file|dir|text|"PROMPT: …">   send
+#   threadtalk get                           receive
+#   threadtalk status                        show state
+#
+set -u
+
+BOX="${THREADTALK_BOX:?set THREADTALK_BOX=/path/to/box}"
+ME="${THREADTALK_ME:?set THREADTALK_ME=<your name>}"
+PEER="${THREADTALK_PEER:?set THREADTALK_PEER=<peer name>}"
+HOST="${THREADTALK_HOST:-}"
+RECV="${THREADTALK_RECV:-$HOME/.threadtalk/receive/$ME}"
+THRESHOLD="${THREADTALK_THRESHOLD:-10485760}"
+
+INBOX="$BOX/exchange/to-$PEER"
+OUTBOX="$BOX/exchange/to-$ME"
+CONSUMED="$BOX/exchange/consumed"
+STAGING="$BOX/.staging"
+DROPS="$BOX/drops"
+
+remote() { # $1 = shell command string, run on the box side
+    if [ -n "$HOST" ]; then ssh -o BatchMode=yes "$HOST" "$1"; else bash -c "$1"; fi
+}
+
+# --- atomic put: stage, then mv into the mailbox ---
+put() { # $1 local file, $2 mailbox name
+    local lf="$1" n="$2"
+    local tmp="$STAGING/$n.$$"
+    remote "mkdir -p '$STAGING' '$INBOX'" >/dev/null 2>&1 || { echo "! cannot reach box"; return 1; }
+    if [ -n "$HOST" ]; then
+        scp -q "$lf" "$HOST:$tmp" 2>/dev/null || { echo "! transfer failed: $n"; return 1; }
+    else
+        cp -p "$lf" "$tmp" 2>/dev/null || { echo "! transfer failed: $n"; return 1; }
+    fi
+    if remote "mv '$tmp' '$INBOX/$n'" >/dev/null 2>&1; then
+        echo "  -> $n"
+        return 0
+    fi
+    remote "rm -f '$tmp'" >/dev/null 2>&1
+    echo "! could not place: $n"
+    return 1
+}
+
+# --- bulk: rsync a dir or a large file into drops/ ---
+bulk() { # $1 path
+    local p="$1" base; base="$(basename "$p")"
+    remote "mkdir -p '$DROPS'" >/dev/null 2>&1 || { echo "! cannot reach box"; return 1; }
+    if [ -d "$p" ]; then
+        if [ -n "$HOST" ]; then rsync -az --progress "$p/" "$HOST:$DROPS/$base/";
+        else mkdir -p "$DROPS/$base" && rsync -az "$p/" "$DROPS/$base/"; fi
+    else
+        if [ -n "$HOST" ]; then rsync -az --progress "$p" "$HOST:$DROPS/";
+        else mkdir -p "$DROPS" && rsync -az "$p" "$DROPS/"; fi
+    fi
+}
+
+send() { # $1 what to send
+    local arg="$1"
+    if [ -d "$arg" ]; then
+        echo "=> directory (bulk)"; bulk "$arg"; return
+    fi
+    if [ -f "$arg" ]; then
+        local size; size=$(wc -c < "$arg" | tr -d ' ')
+        if [ "$size" -gt "$THRESHOLD" ]; then
+            echo "=> large file ($size B) (bulk)"; bulk "$arg"; return
+        fi
+        echo "=> small file ($size B) (mailbox)"; put "$arg" "$(basename "$arg")"; return
+    fi
+    case "$arg" in
+        PROMPT:*|AGENT:*|CMD:*|NOTE:*)
+            local t; t=$(mktemp)
+            printf '%s\n' "$arg" > "$t"
+            echo "=> instruction (mailbox)"
+            put "$t" "msg-$(date '+%Y%m%d-%H%M%S').instr"
+            rm -f "$t" ;;
+        *)
+            local t; t=$(mktemp)
+            printf '%s\n' "$arg" > "$t"
+            echo "=> text (mailbox)"
+            put "$t" "msg-$(date '+%Y%m%d-%H%M%S').txt"
+            rm -f "$t" ;;
+    esac
+}
+
+get() {
+    mkdir -p "$RECV"
+    remote "mkdir -p '$OUTBOX' '$CONSUMED'" >/dev/null 2>&1
+    local listing; listing=$(remote "ls -1 '$OUTBOX' 2>/dev/null") || return 1
+    local f
+    printf '%s\n' "$listing" | while IFS= read -r f; do
+        [ -z "$f" ] && continue
+        case "$f" in .*|drops) continue;; esac
+        if [ -n "$HOST" ]; then
+            scp -q "$HOST:$OUTBOX/$f" "$RECV/$f" 2>/dev/null || { echo "  ! pull failed: $f"; continue; }
+        else
+            cp -p "$OUTBOX/$f" "$RECV/$f" 2>/dev/null || continue
+        fi
+        remote "mv '$OUTBOX/$f' '$CONSUMED/$ME.$f'" >/dev/null 2>&1
+        echo "  <- $f"
+    done
+}
+
+status() {
+    echo "me=$ME peer=$PEER"
+    echo "box=$BOX host=${HOST:-<local>}"
+    echo "-- incoming --"
+    remote "ls -1 '$OUTBOX' 2>/dev/null | grep -v '^\.'" || true
+    echo "-- local receive ($RECV) --"
+    ls -1t "$RECV" 2>/dev/null | head -5 || true
+}
+
+case "${1:-}" in
+    "")       echo "usage: threadtalk <file|dir|text|'PROMPT: …'> | get | status" >&2; exit 2 ;;
+    get)      get ;;
+    status)   status ;;
+    *)        send "$1" ;;
+esac
