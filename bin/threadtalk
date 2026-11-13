@@ -1,28 +1,33 @@
 #!/usr/bin/env bash
 #
-# threadtalk — send / receive messages over a threadtalk box.
+# threadtalk — messages + pairing ("intros") over a shared box of plain files.
 #
 # Config (env):
 #   THREADTALK_BOX    (required) box path, e.g. /srv/threadtalk
-#   THREADTALK_ME     (required) this participant's name, e.g. alice
-#   THREADTALK_PEER   (required) the other participant's name, e.g. bob
-#   THREADTALK_HOST   optional ssh target (user@host). Omit to use a local/shared box.
-#   THREADTALK_RECV   local receive dir (default: ~/.threadtalk/receive/$ME)
+#   THREADTALK_ME     this participant's name (most commands)
+#   THREADTALK_PEER   the other participant (send/get/status)
+#   THREADTALK_HOST   optional ssh target; omit for a local/shared box
+#   THREADTALK_RECV   local receive dir (default ~/.threadtalk/receive/$ME)
 #   THREADTALK_THRESHOLD  bytes above which a file is sent as bulk (default 10 MiB)
+#   THREADTALK_PAIR   optional pair id: derive PEER from the accepted record
 #
 # Usage:
 #   threadtalk <file|dir|text|"PROMPT: …">   send
 #   threadtalk get                           receive
 #   threadtalk status                        show state
+#   threadtalk intro <peer> [note]           create a pairing request
+#   threadtalk intro-accept <id>             accept a pairing request
+#   threadtalk intros                        list pairings (accepted + pending)
 #
 set -u
 
 BOX="${THREADTALK_BOX:?set THREADTALK_BOX=/path/to/box}"
-ME="${THREADTALK_ME:?set THREADTALK_ME=<your name>}"
-PEER="${THREADTALK_PEER:?set THREADTALK_PEER=<peer name>}"
+ME="${THREADTALK_ME:-}"
+PEER="${THREADTALK_PEER:-}"
 HOST="${THREADTALK_HOST:-}"
-RECV="${THREADTALK_RECV:-$HOME/.threadtalk/receive/$ME}"
+RECV="${THREADTALK_RECV:-$HOME/.threadtalk/receive/${ME:-anon}}"
 THRESHOLD="${THREADTALK_THRESHOLD:-10485760}"
+PAIRDIR="$BOX/exchange/pairing"
 
 INBOX="$BOX/exchange/to-$PEER"
 OUTBOX="$BOX/exchange/to-$ME"
@@ -30,100 +35,159 @@ CONSUMED="$BOX/exchange/consumed"
 STAGING="$BOX/.staging"
 DROPS="$BOX/drops"
 
-remote() { # $1 = shell command string, run on the box side
-    if [ -n "$HOST" ]; then ssh -o BatchMode=yes "$HOST" "$1"; else bash -c "$1"; fi
-}
+# ---------------- box helpers (local or ssh) ----------------
+remote() { if [ -n "$HOST" ]; then ssh -o BatchMode=yes "$HOST" "$1"; else bash -c "$1"; fi; }
+box_read()   { if [ -n "$HOST" ]; then ssh -o BatchMode=yes "$HOST" "cat '$1'" 2>/dev/null; else cat "$1" 2>/dev/null; fi; }
+box_write()  { local p="$1" d; d="$(dirname "$p")"
+               if [ -n "$HOST" ]; then ssh -o BatchMode=yes "$HOST" "mkdir -p '$d' && cat > '$p'"
+               else mkdir -p "$d" && cat > "$p"; fi; }
+box_ls()     { if [ -n "$HOST" ]; then ssh -o BatchMode=yes "$HOST" "ls -1 '$1' 2>/dev/null"; else ls -1 "$1" 2>/dev/null; fi; }
+box_exists() { if [ -n "$HOST" ]; then ssh -o BatchMode=yes "$HOST" "test -e '$1'" 2>/dev/null; else test -e "$1"; fi; }
+gen_id()     { od -An -tx1 -N3 /dev/urandom | tr -d ' \n'; }
+field()      { printf '%s\n' "$1" | awk -F': ' -v k="$2" '$0 ~ "^"k":" {sub("^"k": ",""); print; exit}'; }
 
-# --- atomic put: stage, then mv into the mailbox ---
+# ---------------- optional: derive PEER from a pair id ----------------
+if [ -n "${THREADTALK_PAIR:-}" ] && [ -z "$PEER" ]; then
+    _ack="$(box_read "$PAIRDIR/accepted/${THREADTALK_PAIR}.ack")"
+    if [ -n "$_ack" ]; then
+        _f="$(field "$_ack" from)"; _p="$(field "$_ack" peer)"
+        if [ -n "$ME" ] && [ "$ME" = "$_p" ]; then PEER="$_f"; else PEER="$_p"; fi
+        INBOX="$BOX/exchange/to-$PEER"
+    fi
+fi
+
+# ---------------- atomic delivery ----------------
 put() { # $1 local file, $2 mailbox name
     local lf="$1" n="$2"
     local tmp="$STAGING/$n.$$"
     remote "mkdir -p '$STAGING' '$INBOX'" >/dev/null 2>&1 || { echo "! cannot reach box"; return 1; }
-    if [ -n "$HOST" ]; then
-        scp -q "$lf" "$HOST:$tmp" 2>/dev/null || { echo "! transfer failed: $n"; return 1; }
-    else
-        cp -p "$lf" "$tmp" 2>/dev/null || { echo "! transfer failed: $n"; return 1; }
-    fi
-    if remote "mv '$tmp' '$INBOX/$n'" >/dev/null 2>&1; then
-        echo "  -> $n"
-        return 0
-    fi
-    remote "rm -f '$tmp'" >/dev/null 2>&1
-    echo "! could not place: $n"
-    return 1
+    if [ -n "$HOST" ]; then scp -q "$lf" "$HOST:$tmp" 2>/dev/null || { echo "! transfer failed: $n"; return 1; }
+    else cp -p "$lf" "$tmp" 2>/dev/null || { echo "! transfer failed: $n"; return 1; }; fi
+    if remote "mv '$tmp' '$INBOX/$n'" >/dev/null 2>&1; then echo "  -> $n"; return 0; fi
+    remote "rm -f '$tmp'" >/dev/null 2>&1; echo "! could not place: $n"; return 1
 }
 
-# --- bulk: rsync a dir or a large file into drops/ ---
 bulk() { # $1 path
     local p="$1" base; base="$(basename "$p")"
     remote "mkdir -p '$DROPS'" >/dev/null 2>&1 || { echo "! cannot reach box"; return 1; }
     if [ -d "$p" ]; then
-        if [ -n "$HOST" ]; then rsync -az --progress "$p/" "$HOST:$DROPS/$base/";
-        else mkdir -p "$DROPS/$base" && rsync -az "$p/" "$DROPS/$base/"; fi
+        if [ -n "$HOST" ]; then rsync -az --progress "$p/" "$HOST:$DROPS/$base/"; else mkdir -p "$DROPS/$base" && rsync -az "$p/" "$DROPS/$base/"; fi
     else
-        if [ -n "$HOST" ]; then rsync -az --progress "$p" "$HOST:$DROPS/";
-        else mkdir -p "$DROPS" && rsync -az "$p" "$DROPS/"; fi
+        if [ -n "$HOST" ]; then rsync -az --progress "$p" "$HOST:$DROPS/"; else mkdir -p "$DROPS" && rsync -az "$p" "$DROPS/"; fi
     fi
 }
 
-send() { # $1 what to send
+# ---------------- commands ----------------
+cmd_send() {
+    [ -n "$PEER" ] || { echo "! set THREADTALK_PEER" >&2; exit 2; }
     local arg="$1"
-    if [ -d "$arg" ]; then
-        echo "=> directory (bulk)"; bulk "$arg"; return
-    fi
+    if [ -d "$arg" ]; then echo "=> directory (bulk)"; bulk "$arg"; return; fi
     if [ -f "$arg" ]; then
         local size; size=$(wc -c < "$arg" | tr -d ' ')
-        if [ "$size" -gt "$THRESHOLD" ]; then
-            echo "=> large file ($size B) (bulk)"; bulk "$arg"; return
-        fi
+        if [ "$size" -gt "$THRESHOLD" ]; then echo "=> large file ($size B) (bulk)"; bulk "$arg"; return; fi
         echo "=> small file ($size B) (mailbox)"; put "$arg" "$(basename "$arg")"; return
     fi
+    local t; t=$(mktemp)
     case "$arg" in
-        PROMPT:*|AGENT:*|CMD:*|NOTE:*)
-            local t; t=$(mktemp)
-            printf '%s\n' "$arg" > "$t"
-            echo "=> instruction (mailbox)"
-            put "$t" "msg-$(date '+%Y%m%d-%H%M%S').instr"
-            rm -f "$t" ;;
-        *)
-            local t; t=$(mktemp)
-            printf '%s\n' "$arg" > "$t"
-            echo "=> text (mailbox)"
-            put "$t" "msg-$(date '+%Y%m%d-%H%M%S').txt"
-            rm -f "$t" ;;
+        PROMPT:*|AGENT:*|CMD:*|NOTE:*) printf '%s\n' "$arg" > "$t"; echo "=> instruction"
+                                       put "$t" "msg-$(date '+%Y%m%d-%H%M%S').instr" ;;
+        *) printf '%s\n' "$arg" > "$t"; echo "=> text"
+           put "$t" "msg-$(date '+%Y%m%d-%H%M%S').txt" ;;
     esac
+    rm -f "$t"
 }
 
-get() {
+cmd_get() {
+    [ -n "$ME" ] || { echo "! set THREADTALK_ME" >&2; exit 2; }
     mkdir -p "$RECV"
     remote "mkdir -p '$OUTBOX' '$CONSUMED'" >/dev/null 2>&1
     local listing; listing=$(remote "ls -1 '$OUTBOX' 2>/dev/null") || return 1
     local f
     printf '%s\n' "$listing" | while IFS= read -r f; do
         [ -z "$f" ] && continue
-        case "$f" in .*|drops) continue;; esac
-        if [ -n "$HOST" ]; then
-            scp -q "$HOST:$OUTBOX/$f" "$RECV/$f" 2>/dev/null || { echo "  ! pull failed: $f"; continue; }
-        else
-            cp -p "$OUTBOX/$f" "$RECV/$f" 2>/dev/null || continue
-        fi
+        case "$f" in .*) continue;; esac
+        if [ -n "$HOST" ]; then scp -q "$HOST:$OUTBOX/$f" "$RECV/$f" 2>/dev/null || { echo "  ! pull failed: $f"; continue; }
+        else cp -p "$OUTBOX/$f" "$RECV/$f" 2>/dev/null || continue; fi
         remote "mv '$OUTBOX/$f' '$CONSUMED/$ME.$f'" >/dev/null 2>&1
         echo "  <- $f"
     done
 }
 
-status() {
-    echo "me=$ME peer=$PEER"
+cmd_status() {
+    echo "me=${ME:-<unset>} peer=${PEER:-<unset>}"
     echo "box=$BOX host=${HOST:-<local>}"
-    echo "-- incoming --"
-    remote "ls -1 '$OUTBOX' 2>/dev/null | grep -v '^\.'" || true
-    echo "-- local receive ($RECV) --"
-    ls -1t "$RECV" 2>/dev/null | head -5 || true
+    echo "-- incoming --"; remote "ls -1 '$OUTBOX' 2>/dev/null | grep -v '^\\.'" || true
+    echo "-- local receive ($RECV) --"; ls -1t "$RECV" 2>/dev/null | head -5 || true
+}
+
+cmd_intro() {
+    local peer="${1:-}" note="${2:-}" id
+    [ -n "$peer" ] || { echo "usage: threadtalk intro <peer> [note]" >&2; exit 2; }
+    [ -n "$ME" ]   || { echo "! set THREADTALK_ME first" >&2; exit 2; }
+    id="$(gen_id)"
+    { echo "id: $id"; echo "from: $ME"; echo "peer: $peer"
+      echo "note: $note"; echo "created: $(date '+%Y-%m-%dT%H:%M:%S')"; } \
+        | box_write "$PAIRDIR/requests/$id.req"
+    echo "intro $id: $ME -> $peer"
+    echo "  → in the '$peer' thread, run:  threadtalk intro-accept $id"
+}
+
+cmd_intro_accept() {
+    local id="${1:-}" req from peer note
+    [ -n "$id" ] || { echo "usage: threadtalk intro-accept <id>" >&2; exit 2; }
+    [ -n "$ME" ] || { echo "! set THREADTALK_ME first" >&2; exit 2; }
+    req="$(box_read "$PAIRDIR/requests/$id.req")"
+    [ -n "$req" ] || { echo "! no such intro: $id" >&2; exit 1; }
+    from="$(field "$req" from)"; peer="$(field "$req" peer)"; note="$(field "$req" note)"
+    [ "$peer" = "$ME" ] || { echo "! intro $id is addressed to '$peer', but I am '$ME'" >&2; exit 1; }
+    if box_exists "$PAIRDIR/accepted/$id.ack"; then
+        echo "already accepted: $id"
+    else
+        { echo "id: $id"; echo "from: $from"; echo "peer: $peer"
+          echo "accepted_by: $ME"; echo "accepted: $(date '+%Y-%m-%dT%H:%M:%S')"
+          echo "note: $note"; } | box_write "$PAIRDIR/accepted/$id.ack"
+    fi
+    echo "paired: you are '$ME', peer is '$from'   (pair $id)"
+    echo "  export THREADTALK_ME='$ME'"
+    echo "  export THREADTALK_PEER='$from'"
+}
+
+cmd_intros() {
+    local f c id from peer by tag
+    echo "== accepted pairings =="
+    for f in $(box_ls "$PAIRDIR/accepted" 2>/dev/null); do
+        case "$f" in *.ack) ;; *) continue;; esac
+        c="$(box_read "$PAIRDIR/accepted/$f")"
+        from="$(field "$c" from)"; peer="$(field "$c" peer)"; by="$(field "$c" accepted_by)"
+        tag=""
+        [ -n "$ME" ] && [ "$ME" = "$from" ] && tag="   <- you are $from"
+        [ -n "$ME" ] && [ "$ME" = "$peer" ] && tag="   <- you are $peer"
+        printf '  %-8s %-14s <-> %-14s accepted_by=%-10s%s\n' "${f%.ack}" "$from" "$peer" "$by" "$tag"
+    done
+
+    echo "== pending intros =="
+    for f in $(box_ls "$PAIRDIR/requests" 2>/dev/null); do
+        case "$f" in *.req) ;; *) continue;; esac
+        id="${f%.req}"
+        box_exists "$PAIRDIR/accepted/$id.ack" && continue
+        c="$(box_read "$PAIRDIR/requests/$f")"
+        from="$(field "$c" from)"; peer="$(field "$c" peer)"
+        if [ -n "$ME" ] && [ "$peer" = "$ME" ]; then
+            printf '  %-8s from %-14s  → threadtalk intro-accept %s\n' "$id" "$from" "$id"
+        elif [ -n "$ME" ] && [ "$from" = "$ME" ]; then
+            printf '  %-8s to   %-14s  (waiting for them)\n' "$id" "$peer"
+        else
+            printf '  %-8s %s -> %s\n' "$id" "$from" "$peer"
+        fi
+    done
 }
 
 case "${1:-}" in
-    "")       echo "usage: threadtalk <file|dir|text|'PROMPT: …'> | get | status" >&2; exit 2 ;;
-    get)      get ;;
-    status)   status ;;
-    *)        send "$1" ;;
+    "")            echo "usage: threadtalk <file|dir|text|'PROMPT: …'> | get | status | intro <peer> [note] | intro-accept <id> | intros" >&2; exit 2 ;;
+    get)           cmd_get ;;
+    status)        cmd_status ;;
+    intro)         shift; cmd_intro "$@" ;;
+    intro-accept)  shift; cmd_intro_accept "$@" ;;
+    intros)        cmd_intros ;;
+    *)             cmd_send "$1" ;;
 esac

@@ -82,6 +82,28 @@ The box does not push. Something must run:
 A one-shot trigger is preferred over polling when the sender knows the receiver
 is idle: it costs nothing when nothing happens.
 
+## 5b. Intros (pairing)
+
+Participants that have never communicated cannot agree on mailbox names by accident.
+An **intro** is an explicit, file-based pairing:
+
+```
+exchange/pairing/
+├── requests/<id>.req     # { id, from, peer, note, created }
+└── accepted/<id>.ack     # { id, from, peer, accepted_by, accepted, note }
+```
+
+- `intro <peer>` writes `requests/<id>.req` and prints the id.
+- `intro-accept <id>` (run in the **peer's** thread) writes `accepted/<id>.ack`.
+- `intros` lists accepted pairings and pending requests, relative to `ME`.
+
+Rules:
+
+1. **No handshake.** A request is a file; an acceptance is a file.
+2. **Acceptance is deliberate.** The peer thread must be opened and told to accept.
+3. **Many pairings per box.** Ids are independent; each is a lane.
+4. An intro may be used to derive `ME`/`PEER` (e.g. `THREADTALK_PAIR=<id>`).
+
 ## 6. Adapters
 
 Executing an instruction is the only harness-specific concern.

@@ -61,6 +61,42 @@ bin/threadtalk get
 bin/threadtalk-watch 5
 ```
 
+## Intros (pairing two threads)
+
+Two threads that have never met can't guess each other's mailbox name. So there is a
+tiny, deliberate pairing step — an **intro** — and the *acceptance* is the act of
+opening it in the other thread.
+
+```bash
+# in thread A
+threadtalk intro bob "build task"
+#   intro ba8ade: alice -> bob
+#   -> in the 'bob' thread, run: threadtalk intro-accept ba8ade
+
+# in thread B (the user carries the id across, or thread B lists pending intros)
+threadtalk intros                      # bob sees: ba8ade from alice -> accept it
+threadtalk intro-accept ba8ade
+#   paired: you are 'bob', peer is 'alice'   (pair ba8ade)
+#   export THREADTALK_ME='bob'
+#   export THREADTALK_PEER='alice'
+```
+
+A box can hold **many** pairings. `threadtalk intros` lists all accepted pairings
+(with a `<- you are …` marker) and every pending intro, split into *for me* (actionable)
+and *waiting on them*.
+
+A pair id can also drive the mailbox config directly:
+
+```bash
+THREADTALK_ME=bob THREADTALK_PAIR=ba8ade threadtalk status   # me=bob peer=alice
+```
+
+Notes:
+
+- **No handshake, no daemon, no registry.** An intro is a file; an accept is a file.
+- The accept is a **deliberate gesture** — you choose to open it in the other thread.
+- Unaccepted intros just sit there. Nothing expires; nothing rots.
+
 ## Adapters
 
 The only harness-specific piece is "run this instruction". Adapters are one-liners:
